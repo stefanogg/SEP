@@ -1,0 +1,220 @@
+---
+title: "Review of orthopaedic infections in outpatient clinic"
+author: "Stefano Giulieri"
+date: "03/12/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd(stringr::str_c(here::here(), "/"))
+msg <- glue::glue("My directory is {getwd()}")
+message(msg)
+```
+
+Here we review key metrics of 13 patients with othopaedic infections seen in outpatient clinic.
+
+We want to generate a heatmap with key characteristics for each patient and summary parameters for antibiotic duration, number of visits/doctors, number of surgeries.
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(patchwork)
+library(lubridate)
+rm(list = ls())
+```
+
+# Import data
+
+```{r}
+f <- "~/OneDrive - The University of Melbourne/Clinical_work/Ortho_infections/Clinic/SESSION_2021/Ortho_clinical_cases.xlsx"
+names <- excel_sheets(f)
+
+list_ortho <- map(names, ~fill(read_xlsx(f, sheet = .x),
+                             MRN))
+names(list_ortho) <- names
+
+df_infections <- list_ortho$Patients
+df_antibiotics <- list_ortho$Antibiotics
+df_surgeries <- list_ortho$Surgeries
+df_ID <- list_ortho$`ID reviews`
+```
+
+# Generate merge dataset
+
+```{r}
+df_all <- df_infections %>%
+  mutate(infection_type = case_when(
+    str_detect(Diagnosis, "Implant") ~ "Infection after fracture fixation",
+    str_detect(Diagnosis, "Diabetic|vascular") ~ "Diabetic foot / vascular insufficiency",
+    str_detect(Diagnosis, "Spinal") ~ "Haematogenous osteomyelitis / epidural abscess"
+  )) %>%
+  select(MRN, infection_type)
+
+df_route_summary <- df_antibiotics %>%
+  mutate(across(Start:Stop, 
+                lubridate::as_date)) %>%
+  mutate(Stop = if_else(is.na(Stop),
+                        # lubridate::today(),
+                        lubridate::ymd("2021-12-3"),
+                        Stop)) %>%
+  # mutate(duration = Stop - Start) %>%
+  group_by(MRN, Route) %>%
+  summarise(duration = as.integer(max(Stop) - min(Start)))
+
+df_route_summary %>%
+  ggplot(aes(x = duration, fill = Route)) +
+ geom_density() +
+  facet_wrap(~Route, scales = "free_y") +
+  theme_bw()
+
+df_class_summary <- df_antibiotics %>%
+  filter(Antibiotic %in% c("Ciprofloxacin", "Rifampicin")) %>%
+  mutate(across(Start:Stop, 
+                lubridate::as_date)) %>%
+  mutate(Stop = if_else(is.na(Stop),
+                        # lubridate::today(),
+                        lubridate::ymd("2021-12-3"),
+                        Stop)) %>%
+  group_by(MRN, Antibiotic) %>%
+  summarise(duration_class = as.integer(max(Stop) - min(Start)))
+
+df_surgeries_summary <- df_surgeries %>%
+  group_by(MRN) %>%
+  summarise(n_surgeries = n_distinct(Date))
+
+df_reviews_summary <- df_ID %>%
+  group_by(MRN) %>%
+  summarise(n_visits = n_distinct(Date),
+            n_doctors = n_distinct(`ID doctor`),
+            n_me = length(which(str_detect(`ID doctor`, "S"))))
+
+df_all <- df_all %>%
+  left_join(df_route_summary) %>%
+  left_join(df_class_summary) %>%
+  left_join(df_surgeries_summary) %>%
+  left_join(df_reviews_summary)
+
+df_long <- df_all %>%
+  pivot_wider(names_from = "Route", values_from = "duration") %>%
+  rowwise() %>%
+  mutate(TOTAL = sum(IV, PO, na.rm = T)) %>%
+  mutate(total_duration = TOTAL) %>%
+  pivot_wider(names_from = "Antibiotic", values_from = "duration_class") %>%
+  select(-`NA`) %>%
+  pivot_longer(c(n_surgeries:TOTAL, Ciprofloxacin:Rifampicin), names_to = "metric", values_to = "value") 
+
+```
+
+# Plot heatmap
+
+```{r}
+p1 <- df_long %>%
+  filter(metric %in% c("PO", "IV", "TOTAL")) %>%
+  ggplot(aes(x = fct_relevel(metric, "TOTAL"), y = fct_reorder(as.factor(MRN), total_duration, .desc = T), fill = value*0.032855)) +
+  geom_tile() +
+  scale_fill_viridis_c(na.value = NA, name = "Antibiotic duration\n(months)") +
+  scale_x_discrete(name = "Antibiotic duration", position = "top") +
+  scale_y_discrete(name = "Patient", breaks = NULL) +
+  theme_bw(base_size = 20) +
+  theme(text = element_text(face = "bold"))
+p1 
+
+y_order <- ggplot_build(p1)$layout$panel_params[[1]]$y$get_limits()
+
+p2 <- df_long %>%
+  filter(str_detect(metric, "n_")) %>%
+  filter(metric != "n_me") %>%
+  ggplot(aes(x = metric, y = fct_relevel(as.factor(MRN), y_order), fill = as_factor(value))) +
+  geom_tile() +
+ # scale_fill_gradient2(low = "blue", high = "red", midpoint = 0, name = "Number of distinct\noccurrences") +
+  scale_fill_brewer(name = "Number of distinct\noccurrences") +
+  scale_x_discrete(name = "Management", position = "top") +
+  scale_y_discrete(name = "", breaks = NULL) +
+  theme_bw(base_size = 20) +
+  theme(text = element_text(face = "bold"))
+p2
+
+p1 + p2 +
+  plot_layout(guides = "collect")
+
+# ggsave("figures/ortho_clinic_metrics_heatmap.pdf", width = 12)
+```
+
+# Plot as timeline
+
+```{r}
+df_timeline <- df_antibiotics %>%
+  mutate(across(Start:Stop, 
+                lubridate::as_date)) %>%
+  mutate(Stop = if_else(is.na(Stop),
+                        # lubridate::today(),
+                        lubridate::ymd("2021-12-3"),
+                        Stop)) %>%
+  mutate(antibiotic_interval = Start %--% Stop) 
+
+union_interval <- function(int){
+  int <- sort(int)
+  union <- c()
+  for (i in seq_along(int)){
+    if (i == 1) {
+      out <- int[i]
+    } else {
+      if (int_overlaps(last(out), int[i])){
+        out <- union(last(out), int[i])
+      } else {
+        out <- c(out, int[i])
+      }
+    }
+  }
+  return(out)
+}
+int <- df_timeline$antibiotic_interval
+union_interval(int)
+
+df_timeline <- df_timeline %>%
+  group_by(MRN, Route) %>%
+  summarise(antibiotic_interval = union_interval(antibiotic_interval)) %>%
+  mutate(Start = int_start(antibiotic_interval), Stop = int_end(antibiotic_interval)) %>%
+  group_by(MRN) %>%
+  mutate(start_day = as.numeric(Start - min(Start),
+                                            units = "days"),
+         stop_day = as.integer(Stop - min(Start)),
+         total_duration = sum(stop_day - start_day)) %>%
+  ungroup() %>%
+  mutate(MRN = fct_reorder(as.factor(MRN), total_duration, .desc = T))
+data_points <- df_timeline %>% filter(total_duration > 100) %>%
+  group_by(MRN) %>%
+  summarise(x = max(stop_day) + 10)
+df_timeline %>%
+  ggplot(aes(x = start_day, y = MRN, colour = Route)) +
+  geom_segment(aes(xend = stop_day, yend = MRN), 
+               linewidth = 3) +
+  geom_point(data = data_points, inherit.aes = F, aes(x = x, y = MRN)) +
+  scale_colour_brewer(palette = "Paired") +
+  labs(x = "Days since start of therapy", y = "Patient") +
+  theme_bw() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+
+# Extract key metrics
+
+```{r}
+df_all %>%
+  pivot_wider(names_from = "Route", values_from = "duration") %>%
+  rowwise() %>%
+  mutate(TOTAL = sum(IV, PO, na.rm = T))%>%
+  ungroup() %>%
+   pivot_wider(names_from = "Antibiotic", values_from = "duration_class") %>%
+  select(-`NA`) %>%
+  mutate(infection_type = as.factor(infection_type)) %>%
+  mutate(across(IV:Rifampicin,
+                ~.*0.032855)) %>%
+  skimr::skim()
+```
+
